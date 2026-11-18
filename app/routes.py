@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import User, get_session
 from app.exceptions import ConflictError, raise_auth_error
 from app.schemas import LoginIn, RegisterIn, TokenOut, UserOut
-from app.security import create_access_token, hash_password, verify_password
+from app.security import create_access_token, hash_password, verify_password, DUMMY_HASH
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -28,6 +28,9 @@ async def register(data: RegisterIn, session: AsyncSession = Depends(get_session
 @router.post("/login", response_model=TokenOut)
 async def login(data: LoginIn, session: AsyncSession = Depends(get_session)):
     user = await session.scalar(select(User).where(User.email == data.email.lower()))
-    if user is None or not await verify_password(data.password, user.password_hash):
+    # Always run the slow password check, even for unknown emails, so both
+    # failures take the same time and can't be told apart by timing.
+    password_ok = await verify_password(data.password, user.password_hash if user else DUMMY_HASH)
+    if user is None or not password_ok:
         await raise_auth_error("Incorrect email or password")
     return TokenOut(access_token=create_access_token(user.id))
