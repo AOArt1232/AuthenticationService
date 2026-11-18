@@ -1,4 +1,5 @@
 from fastapi import Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 
@@ -21,3 +22,10 @@ async def auth_error_handler(request: Request, exc: AuthError) -> JSONResponse:
 
 async def raise_auth_error(detail: str, status_code: int = 401) -> None:
     raise AuthError(detail, status_code)
+
+
+async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    # FastAPI's default 422 echoes back what was sent ("input"), which would
+    # include the password. Return only where the error is and what's wrong.
+    errors = [{"loc": e["loc"], "msg": e["msg"], "type": e["type"]} for e in exc.errors()]
+    return JSONResponse({"detail": errors}, status_code=422)

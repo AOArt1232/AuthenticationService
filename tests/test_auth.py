@@ -78,3 +78,187 @@ async def test_login_email_case_insensitive(client):
     await register(client)
     assert (await login(client, email=EMAIL.upper())).status_code == 200
 
+
+
+async def test_login_timing_same_for_unknown_email(client, monkeypatch):
+    # Both failure paths must run the password hash exactly once.
+    import app.routes as routes
+
+    calls = []
+    real = routes.verify_password
+
+    async def counting(password, stored):
+        calls.append(stored)
+        return await real(password, stored)
+
+    monkeypatch.setattr(routes, "verify_password", counting)
+    await register(client)
+    assert (await login(client, password="Wr0ng#Pass")).status_code == 401
+    assert (await login(client, email="ghost@example.com")).status_code == 401
+    assert len(calls) == 2
+
+
+# --- Tests that need the JWT token ---
+
+def auth(token):
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def get_token(client):
+    await register(client)
+    return (await login(client)).json()["access_token"]
+
+
+async def test_me_with_token(client):
+    token = await get_token(client)
+    r = await client.get("/auth/me", headers=auth(token))
+    assert r.status_code == 200
+    assert r.json()["email"] == EMAIL
+
+
+async def test_me_without_token(client):
+    r = await client.get("/auth/me")
+    assert r.status_code == 401
+    assert r.json()["detail"] == "Not authenticated"
+
+
+async def test_me_with_garbage_token(client):
+    assert (await client.get("/auth/me", headers=auth("not-a-jwt"))).status_code == 401
+
+
+async def test_me_with_tampered_token(client):
+    # Change the payload to pretend to be user 999; the signature no longer matches.
+    import base64
+    import json
+
+    token = await get_token(client)
+    header, payload, signature = token.split(".")
+    data = json.loads(base64.urlsafe_b64decode(payload + "=="))
+    data["sub"] = "999"
+    fake = base64.urlsafe_b64encode(json.dumps(data).encode()).rstrip(b"=").decode()
+    r = await client.get("/auth/me", headers=auth(f"{header}.{fake}.{signature}"))
+    assert r.status_code == 401
+
+
+async def test_me_with_token_signed_by_wrong_secret(client):
+    import jwt
+
+    await get_token(client)
+    forged = jwt.encode({"sub": "1"}, "someone-elses-secret-0123456789abcdef", algorithm="HS256")
+    assert (await client.get("/auth/me", headers=auth(forged))).status_code == 401
+
+
+async def test_me_with_expired_token(client, monkeypatch):
+    from app.config import settings
+
+    await register(client)
+    monkeypatch.setattr(settings, "access_token_minutes", -1)  # token born already expired
+    token = (await login(client)).json()["access_token"]
+    r = await client.get("/auth/me", headers=auth(token))
+    assert r.status_code == 401
+    assert r.json()["detail"] == "Invalid or expired token"
+
+
+# --- Unknown users and JWT content ---
+
+def make_token(**claims):
+    import time
+
+    import jwt
+
+    from app.config import settings
+
+    now = int(time.time())
+    data = {"sub": "1", "iat": now, "exp": now + 600} | claims
+    data = {k: v for k, v in data.items() if v is not None}
+    return jwt.encode(data, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
+async def test_me_unknown_user_same_error_as_bad_token(client):
+    # Correctly signed token for a user id that doesn't exist.
+    await get_token(client)
+    r = await client.get("/auth/me", headers=auth(make_token(sub="999")))
+    assert r.status_code == 401
+    assert r.json()["detail"] == "Invalid or expired token"
+
+
+async def test_me_correctly_signed_token_works(client):
+    await get_token(client)
+    r = await client.get("/auth/me", headers=auth(make_token(sub="1")))
+    assert r.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "claims",
+    [
+        {"sub": None},             # missing sub
+        {"exp": None},             # missing exp
+        {"iat": None},             # missing iat
+        {"sub": "abc"},            # sub not a number
+        {"sub": "0"},              # not a valid id
+        {"sub": "-1"},
+        {"sub": ""},
+        {"sub": "1", "admin": True},  # unexpected extra claim
+    ],
+)
+async def test_me_rejects_bad_token_content(client, claims):
+    await get_token(client)
+    r = await client.get("/auth/me", headers=auth(make_token(**claims)))
+    assert r.status_code == 401
+    assert r.json()["detail"] == "Invalid or expired token"
+
+
+async def test_me_rejects_unsigned_token(client):
+    import jwt
+
+    await get_token(client)
+    token = jwt.encode({"sub": "1", "iat": 0, "exp": 9999999999}, None, algorithm="none")
+    assert (await client.get("/auth/me", headers=auth(token))).status_code == 401
+
+
+async def test_me_rejects_wrong_auth_scheme(client):
+    token = await get_token(client)
+    r = await client.get("/auth/me", headers={"Authorization": f"Basic {token}"})
+    assert r.status_code == 401
+
+
+# --- Invalid input data ---
+
+@pytest.mark.parametrize("path", ["/auth/register", "/auth/login"])
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"email": EMAIL},
+        {"password": GOOD},
+        {"email": None, "password": GOOD},
+        {"email": EMAIL, "password": None},
+        {"email": 123, "password": GOOD},
+        {"email": EMAIL, "password": 12345678},
+        {"email": ["a@b.com"], "password": GOOD},
+        {"email": EMAIL, "password": GOOD, "is_admin": True},  # unknown field
+    ],
+)
+async def test_invalid_body(client, path, body):
+    assert (await client.post(path, json=body)).status_code == 422
+
+
+@pytest.mark.parametrize("path", ["/auth/register", "/auth/login"])
+async def test_not_json(client, path):
+    r = await client.post(path, content="email=a&password=b",
+                          headers={"Content-Type": "application/x-www-form-urlencoded"})
+    assert r.status_code == 422
+    r = await client.post(path, content="{broken json", headers={"Content-Type": "application/json"})
+    assert r.status_code == 422
+
+
+async def test_login_empty_and_huge_password(client):
+    await register(client)
+    assert (await login(client, password="")).status_code == 422
+    assert (await login(client, password="A1#a" * 100)).status_code == 422
+
+
+async def test_errors_never_echo_password(client):
+    r = await register(client, password="Has@Symbol1")
+    assert r.status_code == 422
+    assert "Has@Symbol1" not in r.text
