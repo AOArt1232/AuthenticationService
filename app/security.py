@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import hmac
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import jwt
@@ -34,10 +35,12 @@ async def verify_password(password: str, stored: str) -> bool:
 DUMMY_HASH = f"{os.urandom(16).hex()}${_hash_sync(os.urandom(16).hex(), os.urandom(16)).hex()}"
 
 
-def create_access_token(user_id: int) -> str:
+def create_access_token(user_id: int, token_version: int) -> str:
     now = datetime.now(timezone.utc)
     payload = {
         "sub": str(user_id),
+        "jti": uuid.uuid4().hex,
+        "ver": token_version,
         "iat": now,
         "exp": now + timedelta(minutes=settings.access_token_minutes),
     }
@@ -54,6 +57,6 @@ def decode_token(token: str) -> TokenPayload:
         token,
         settings.jwt_secret,
         algorithms=[settings.jwt_algorithm],
-        options={"require": ["sub", "iat", "exp"]},
+        options={"require": ["sub", "iat", "exp", "jti", "ver"]},
     )
     return TokenPayload.model_validate(data)
