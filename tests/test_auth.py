@@ -169,7 +169,7 @@ def make_token(**claims):
     from app.config import settings
 
     now = int(time.time())
-    data = {"sub": "1", "iat": now, "exp": now + 600} | claims
+    data = {"sub": "1", "iat": now, "exp": now + 600, "jti": "a" * 32, "ver": 0} | claims
     data = {k: v for k, v in data.items() if v is not None}
     return jwt.encode(data, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
@@ -192,6 +192,11 @@ async def test_me_correctly_signed_token_works(client):
     "claims",
     [
         {"sub": None},             # missing sub
+        {"jti": None},             # missing jti
+        {"ver": None},             # missing ver
+        {"jti": "short"},          # jti in the wrong format
+        {"ver": -1},
+        {"ver": "zero"},
         {"exp": None},             # missing exp
         {"iat": None},             # missing iat
         {"sub": "abc"},            # sub not a number
@@ -262,3 +267,108 @@ async def test_errors_never_echo_password(client):
     r = await register(client, password="Has@Symbol1")
     assert r.status_code == 422
     assert "Has@Symbol1" not in r.text
+
+
+# --- Logout ---
+
+async def test_logout_revokes_token(client):
+    token = await get_token(client)
+    r = await client.post("/auth/logout", headers=auth(token))
+    assert r.status_code == 200
+    assert r.json()["detail"] == "Logged out"
+    assert (await client.get("/auth/me", headers=auth(token))).status_code == 401
+    assert (await client.post("/auth/logout", headers=auth(token))).status_code == 401
+
+
+async def test_logout_only_ends_that_session(client):
+    token1 = await get_token(client)
+    token2 = (await login(client)).json()["access_token"]  # e.g. a second device
+    assert token1 != token2
+    await client.post("/auth/logout", headers=auth(token1))
+    assert (await client.get("/auth/me", headers=auth(token2))).status_code == 200
+
+
+async def test_logout_needs_token(client):
+    assert (await client.post("/auth/logout")).status_code == 401
+    assert (await client.post("/auth/logout", headers=auth("garbage"))).status_code == 401
+
+
+async def test_login_again_after_logout(client):
+    token = await get_token(client)
+    await client.post("/auth/logout", headers=auth(token))
+    new = (await login(client)).json()["access_token"]
+    assert (await client.get("/auth/me", headers=auth(new))).status_code == 200
+
+
+# --- Password change ---
+
+NEW = "N3w$Secret"
+
+
+async def change(client, token, old=GOOD, new=NEW):
+    return await client.post(
+        "/auth/change-password",
+        json={"old_password": old, "new_password": new},
+        headers=auth(token),
+    )
+
+
+async def test_change_password(client):
+    token = await get_token(client)
+    r = await change(client, token)
+    assert r.status_code == 200
+    assert (await login(client)).status_code == 401           # old password stops working
+    assert (await login(client, password=NEW)).status_code == 200
+
+
+async def test_change_password_logs_out_all_devices(client):
+    token1 = await get_token(client)
+    token2 = (await login(client)).json()["access_token"]
+    await change(client, token1)
+    assert (await client.get("/auth/me", headers=auth(token1))).status_code == 401
+    assert (await client.get("/auth/me", headers=auth(token2))).status_code == 401
+    fresh = (await login(client, password=NEW)).json()["access_token"]
+    assert (await client.get("/auth/me", headers=auth(fresh))).status_code == 200
+
+
+async def test_change_password_wrong_old(client):
+    token = await get_token(client)
+    r = await change(client, token, old="Wr0ng#Pass")
+    assert r.status_code == 400
+    assert (await login(client)).status_code == 200          # nothing changed
+
+
+async def test_change_password_same_as_old(client):
+    token = await get_token(client)
+    assert (await change(client, token, new=GOOD)).status_code == 400
+
+
+@pytest.mark.parametrize("new", ["weak", "NoDigits###", "Has@Symbol1", "Aa1!" * 7])
+async def test_change_password_new_must_follow_rules(client, new):
+    token = await get_token(client)
+    assert (await change(client, token, new=new)).status_code == 422
+
+
+async def test_change_password_needs_token(client):
+    await register(client)
+    r = await client.post("/auth/change-password", json={"old_password": GOOD, "new_password": NEW})
+    assert r.status_code == 401
+    assert (await login(client)).status_code == 200
+
+
+async def test_change_password_with_logged_out_token(client):
+    token = await get_token(client)
+    await client.post("/auth/logout", headers=auth(token))
+    assert (await change(client, token)).status_code == 401
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{}, {"old_password": GOOD}, {"new_password": NEW},
+     {"old_password": GOOD, "new_password": NEW, "extra": 1},
+     {"old_password": None, "new_password": NEW}],
+)
+async def test_change_password_invalid_body(client, body):
+    token = await get_token(client)
+    r = await client.post("/auth/change-password", json=body, headers=auth(token))
+    assert r.status_code == 422

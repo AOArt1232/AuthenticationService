@@ -41,6 +41,19 @@ class LoginIn(BaseModel):
     password: str = Field(min_length=1, max_length=128)
 
 
+class PasswordChangeIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    old_password: str = Field(min_length=1, max_length=128)
+    new_password: str
+
+    _check = field_validator("new_password")(validate_password)
+
+
+class MessageOut(BaseModel):
+    detail: str
+
+
 class UserOut(BaseModel):
     id: int
     email: EmailStr
@@ -60,6 +73,8 @@ class TokenPayload(BaseModel):
     sub: str = Field(pattern=r"^[1-9][0-9]*$")  # the user's id, as a string
     iat: int
     exp: int
+    jti: str = Field(pattern=r"^[0-9a-f]{32}$")  # unique id of this token, used by logout
+    ver: int = Field(ge=0)  # user's token_version when the token was made
 
     @property
     def user_id(self) -> int:
